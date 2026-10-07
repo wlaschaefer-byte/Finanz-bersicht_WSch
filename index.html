@@ -41,23 +41,72 @@
         onSnapshot(cb){ (L[c] = L[c] || []).push(cb); setTimeout(() => cb(snap(c)), 0); return () => { L[c] = (L[c] || []).filter(x => x !== cb); }; },
         add: async v => { const id = "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); await db.doc(c + "/" + id).set(v); return { id }; } };
       return q; } };
-  /* Dateien: auf dem Handy über „Teilen“ (dort lässt sich Google Drive wählen), sonst als normaler Download. */
+  /* ---- Wohin Dateien gehen ----
+     "ordner":   fester Ordner, den du einmal auswählst — die Mappe schreibt dann ohne Nachfrage hinein (wenn der Browser das kann).
+     "download": direkt in den Download-Ordner, ohne Teilen-Menü.
+     "teilen":   Teilen-Menü (z. B. um nach Drive zu schicken).                                              */
+  const kannOrdner = typeof window.showDirectoryPicker === "function";
+  const modus = () => { try{ return localStorage.getItem("bm_ziel") || "download"; }catch(e){ return "download"; } };
+  const setModus = m => { try{ localStorage.setItem("bm_ziel", m); }catch(e){} };
+  let ordner = null;
+  const ordnerLaden = async () => { try{ ordner = await tx("readonly", s => s.get("_intern/ordner")); }catch(e){ ordner = null; } return ordner; };
+  const darf = async fragen => { if(!ordner) return false;
+    try{ if((await ordner.queryPermission({mode:"readwrite"})) === "granted") return true;
+      if(fragen) return (await ordner.requestPermission({mode:"readwrite"})) === "granted"; }catch(e){}
+    return false; };
+  const inOrdner = async (name, blob) => { const fh = await ordner.getFileHandle(name, {create:true}); const w = await fh.createWritable(); await w.write(blob); await w.close(); };
+  const runter = (blob, filename) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 20000); };
+  let still = false;   /* true = automatische Sicherung: nie nachfragen, nie ein Menü öffnen */
   const downloads = { save: async ({ filename, data, mimeType }) => {
       const typ = mimeType || (/\.json$/i.test(filename) ? "application/json" : /\.csv$/i.test(filename) ? "text/csv" : /\.html?$/i.test(filename) ? "text/html" : "text/plain");
       const blob = data instanceof Blob ? data : new Blob([data], { type: typ + ";charset=utf-8" });
-      if(/Sicherung/i.test(filename)) try{ localStorage.setItem("bm_letzte_sicherung", new Date().toISOString()); }catch(e){}
-      const mobil = /Android|iPhone|iPad/i.test(navigator.userAgent);
-      try{ const f = new File([blob], filename, { type: typ });
-        if(mobil && navigator.canShare && navigator.canShare({ files: [f] })){ await navigator.share({ files: [f], title: filename }); return { ok: true }; } }catch(e){ if(e && e.name === "AbortError") throw e; }
-      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 20000); return { ok: true }; } };
+      const sich = /Sicherung/i.test(filename), m = modus();
+      const gemerkt = () => { if(sich) try{ localStorage.setItem("bm_letzte_sicherung", new Date().toISOString()); }catch(e){} zielZeigen(); };
+      if(m === "ordner" && ordner && await darf(!still)){
+        try{ await inOrdner(filename, blob); if(sich) await inOrdner("Belegmappe-Sicherung-aktuell.json", blob); gemerkt();
+          if(!still && typeof flashOk === "function") flashOk("Gespeichert im Ordner „" + ordner.name + "“."); return { ok: true }; }catch(e){}
+      }
+      if(still) throw new Error("kein Ordnerzugriff");
+      if(m === "teilen"){ try{ const f = new File([blob], filename, { type: typ });
+          if(navigator.canShare && navigator.canShare({ files: [f] })){ await navigator.share({ files: [f], title: filename }); gemerkt(); return { ok: true }; } }catch(e){ if(e && e.name === "AbortError") throw e; } }
+      runter(blob, filename); gemerkt(); return { ok: true }; } };
+  /* Bedienung in der Karte „Export und Sicherung“ */
+  function zielZeigen(){ const el = document.getElementById("bmZielInfo"); if(!el) return;
+    const l = (()=>{ try{ return localStorage.getItem("bm_letzte_sicherung"); }catch(e){ return null; } })(), m = modus();
+    el.textContent = (m === "ordner" && ordner ? "Sicherungen gehen ohne Nachfrage in den Ordner „" + ordner.name + "“, einmal täglich auch von selbst." : m === "teilen" ? "Sicherungen öffnen das Teilen-Menü (z. B. für Drive)." : "Sicherungen landen ohne Nachfrage im Download-Ordner.")
+      + (l ? " Letzte Sicherung: " + new Date(l).toLocaleString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit"}) + "." : " Noch keine Sicherung.");
+    document.querySelectorAll("[data-bmziel]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.bmziel === m))); }
+  function zielBauen(){ const note = document.getElementById("exportNote"); if(!note || document.getElementById("bmZiel")) return;
+    const box = document.createElement("div"); box.id = "bmZiel"; box.style.cssText = "margin:12px 0 0;padding-top:12px;border-top:1px solid var(--line-2)";
+    box.innerHTML = '<p class="eyebrow" style="margin:0 0 6px">Wohin die Sicherung geht</p><div class="chips" style="margin:0 0 6px">'
+      + (kannOrdner ? '<button type="button" class="chip" data-bmziel="ordner">Fester Ordner</button>' : '')
+      + '<button type="button" class="chip" data-bmziel="download">Download-Ordner</button><button type="button" class="chip" data-bmziel="teilen">Teilen (Drive)</button></div>'
+      + '<p class="tiny muted" id="bmZielInfo" style="margin:0"></p>'
+      + (kannOrdner ? '' : '<p class="tiny muted" style="margin:6px 0 0">Einen festen Ordner lässt dieser Browser nicht zu.</p>');
+    note.parentNode.insertBefore(box, note.nextSibling);
+    box.querySelectorAll("[data-bmziel]").forEach(b => b.addEventListener("click", async () => { const z = b.dataset.bmziel;
+      if(z === "ordner"){ try{ const h = await window.showDirectoryPicker({ mode: "readwrite", id: "belegmappe" }); ordner = h; await tx("readwrite", s => s.put(h, "_intern/ordner")); }
+        catch(e){ if(!ordner){ zielZeigen(); return; } } }
+      setModus(z); zielZeigen(); }));
+    zielZeigen(); }
+  /* Einmal am Tag von selbst sichern — nur wenn der Ordner schon freigegeben ist, sonst würde der Browser nachfragen. */
+  async function autoSicherung(){ try{
+      if(modus() !== "ordner" || !ordner || !(await darf(false))) return;
+      if(!Object.keys(MEM.belege || {}).length || typeof KEY === "undefined" || !KEY) return;
+      const l = localStorage.getItem("bm_letzte_sicherung"); if(l && l.slice(0,10) === new Date().toISOString().slice(0,10)) return;
+      const btn = document.getElementById("backupBtn"); if(!btn) return;
+      still = true; btn.click(); setTimeout(() => { still = false; }, 15000);
+    }catch(e){ still = false; } }
   window.claude = { use: async n => { await bereit; return n === "db" ? db : n === "downloads" ? downloads : n === "user" ? { isOwner: () => true } : null; } };
-  /* Erinnerung an die Sicherung: die Daten liegen nur hier — geht das Handy verloren, sind sie ohne Sicherung weg. */
-  window.addEventListener("load", () => setTimeout(() => { try{
+  window.addEventListener("load", () => { ordnerLaden().then(() => { const warte = setInterval(() => { if(document.getElementById("exportNote")){ zielBauen(); } }, 1500);
+      setTimeout(() => clearInterval(warte), 60000); });
+    setTimeout(autoSicherung, 20000);
+    /* Erinnerung: die Daten liegen nur hier — ohne Sicherung sind sie weg, wenn das Handy verloren geht. */
+    setTimeout(() => { try{
       const n = Object.keys(MEM.belege || {}).length; if(!n || typeof flash !== "function") return;
       const l = localStorage.getItem("bm_letzte_sicherung"), tage = l ? Math.floor((Date.now() - new Date(l).getTime()) / 86400000) : null;
-      if(tage == null || tage >= 14) flash(tage == null ? "Noch keine Sicherung gemacht — Übersicht → Export → „5 · Komplett (JSON)“ und in Google Drive ablegen." : "Letzte Sicherung vor " + tage + " Tagen — Übersicht → Export → „5 · Komplett (JSON)“.");
-    }catch(e){} }, 9000));
+      if(tage == null || tage >= 14) flash(tage == null ? "Noch keine Sicherung gemacht — Übersicht → Export → „5 · Komplett (JSON)“." : "Letzte Sicherung vor " + tage + " Tagen — Übersicht → Export → „5 · Komplett (JSON)“.");
+    }catch(e){} }, 30000); });
   if("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 })();
 
